@@ -1,8 +1,8 @@
-require File.join(File.dirname(__FILE__), "geometry")
-require File.join(File.dirname(__FILE__), "tempfile_ext")
+require "geometry"
+require "tempfile_ext"
 
 module AttachmerbFu # :nodoc:
-  @@default_processors = %w(ImageScience Rmagick MiniMagick)
+  @@default_processors = %w(Gd2 ImageScience Rmagick MiniMagick)
   @@tempfile_path      = File.join(Merb.root, 'tmp', 'attachment_fu')
   @@content_types      = ['image/jpeg', 'image/pjpeg', 'image/gif', 'image/png', 'image/x-png', 'image/jpg']
   attr_reader :content_types, :tempfile_path, :default_processors
@@ -14,6 +14,12 @@ module AttachmerbFu # :nodoc:
 
   class ThumbnailError < StandardError;  end
   class AttachmentError < StandardError; end
+
+  module IncActMethods
+    def self.included(base)
+      base.extend ActMethods
+    end
+  end
 
   module ActMethods
     # Options: 
@@ -67,25 +73,26 @@ module AttachmerbFu # :nodoc:
         attachment_options[:storage]     ||= :file_system
         attachment_options[:path_prefix] ||= attachment_options[:file_system_path]
         if attachment_options[:path_prefix].nil?
-          attachment_options[:path_prefix] = File.join("public", table.name)
+          attachment_options[:path_prefix] = File.join("public", self.name.snake_case.plural)
         end
         attachment_options[:path_prefix]   = attachment_options[:path_prefix][1..-1] if options[:path_prefix][0] == '/'
 
-        has_many   :thumbnails, :class_name => attachment_options[:thumbnail_class].to_s, :foreign_key => 'parent_id'
-        belongs_to :parent, :class_name => table.klass.to_s, :foreign_key => 'parent_id'
+        has n, :thumbnails, :class_name => attachment_options[:thumbnail_class].to_s, :child_key => [:parent_id]
+        #belongs_to :parent, :class_name => table.klass.to_s, :foreign_key => 'parent_id'
 
-        before_update :rename_file
-        before_destroy :destroy_thumbnails
+        before :update, :rename_file
+        before :destroy, :destroy_thumbnails
 
-        before_validation :set_size_from_temp_path
-        after_save :after_process_attachment
-        after_destroy :destroy_file
+        before :valid?, :set_size_from_temp_path
+        after :valid?, :process_attachment
+        after :save, :after_process_attachment
+        after :destroy, :destroy_file
         extend  ClassMethods
+
         include InstanceMethods
-        
-        backend = "#{options[:storage].to_s.classify}Backend"
+        backend = "#{options[:storage].to_s.camel_case}Backend"
         require "attachmerb_fu/backends/#{backend.snake_case}"
-        include AttachmerbFu::Backends.const_get(backend)
+        include AttachmerbFu::Backends.full_const_get(backend)
 
         case attachment_options[:processor]
           when :none
@@ -98,7 +105,7 @@ module AttachmerbFu # :nodoc:
                 
                 include AttachmerbFu::Processors.const_get(attachment_options[:processor])
               end
-            rescue LoadError
+            rescue LoadError, NameError
               processors.shift
               retry
             end
@@ -112,7 +119,6 @@ module AttachmerbFu # :nodoc:
             end
         end
         
-        after_validation :process_attachment
       end
     end
   end
@@ -124,8 +130,8 @@ module AttachmerbFu # :nodoc:
 
     # Performs common validations for attachment models.
     def validates_as_attachment
-      validates_presence_of :size, :content_type, :filename
-      validate              :attachment_attributes_valid?
+      validates_present :size, :content_type, :filename
+      validates_with_method :attachment_attributes_valid?
     end
 
     # Returns true or false if the given content type is recognized as an image.
@@ -179,19 +185,21 @@ module AttachmerbFu # :nodoc:
 
     # Copies the given file path to a new tempfile, returning the closed tempfile.
     def copy_to_temp_file(file, temp_base_name)
-      returning Tempfile.new(temp_base_name, AttachmerbFu.tempfile_path) do |tmp|
-        tmp.close
-        FileUtils.cp file, tmp.path
-      end
+      FileUtils.mkdir_p(AttachmerbFu.tempfile_path)
+      tmp = Tempfile.new(temp_base_name, AttachmerbFu.tempfile_path)
+      tmp.close
+      FileUtils.cp file, tmp.path
+      tmp
     end
 
     # Writes the given data to a new tempfile, returning the closed tempfile.
     def write_to_temp_file(data, temp_base_name)
-      returning Tempfile.new(temp_base_name, AttachmerbFu.tempfile_path) do |tmp|
-        tmp.binmode
-        tmp.write data
-        tmp.close
-      end
+      FileUtils.mkdir_p(AttachmerbFu.tempfile_path)
+      tmp = Tempfile.new(temp_base_name, AttachmerbFu.tempfile_path)
+      tmp.binmode
+      tmp.write data
+      tmp.close
+      tmp
     end
   end
 
@@ -240,12 +248,14 @@ module AttachmerbFu # :nodoc:
 
     # Sets the content type.
     def content_type=(new_type)
-      write_attribute :content_type, new_type.to_s.strip
+      #write_attribute :content_type, new_type.to_s.strip
+      self.attributes[:content_type] = new_type.to_s.strip
     end
 
     # Sanitizes a filename.
     def filename=(new_name)
-      write_attribute :filename, sanitize_filename(new_name)
+      #write_attribute :filename, sanitize_filename(new_name)
+      self.attributes[:filename] = sanitize_filename(new_name)
     end
 
     # Returns the width/height in a suitable format for the image_tag helper: (100x100)
@@ -367,8 +377,10 @@ module AttachmerbFu # :nodoc:
       def attachment_attributes_valid?
         [:size, :content_type].each do |attr_name|
           enum = attachment_options[attr_name]
-          errors.add attr_name, ActiveRecord::Errors.default_error_messages[:inclusion] unless enum.nil? || enum.include?(send(attr_name))
+          #errors.add attr_name, ActiveRecord::Errors.default_error_messages[:inclusion] unless enum.nil? || enum.include?(send(attr_name))
+          return [false, "Invalid content type"] unless enum.nil? || enum.include?(send(attr_name))
         end
+	true
       end
 
       # Initializes a new thumbnail with the given suffix.
@@ -383,8 +395,16 @@ module AttachmerbFu # :nodoc:
       end
 
       # Stub for a #process_attachment method in a processor
-      def process_attachment
+      def process_attachment_without_processing
         @saved_attachment = save_attachment?
+      end
+
+      def process_attachment
+        if respond_to?(:process_attachment_with_processing)
+          process_attachment_with_processing
+        else
+          process_attachment_without_processing
+	end
       end
 
       # Cleans up after processing.  Thumbnails are created, the attachment is stored to the backend, and the temp_paths are cleared.
@@ -429,4 +449,18 @@ module AttachmerbFu # :nodoc:
         self.thumbnails.each { |thumbnail| thumbnail.destroy } if thumbnailable?
       end
   end
+end
+
+    
+# make sure we're running inside Merb
+if defined?(Merb::Plugins)
+
+  # Merb gives you a Merb::Plugins.config hash...feel free to put your stuff in your piece of it
+  Merb::Plugins.config[:attachmerb_fu] = {
+  }
+  
+  #Merb::Plugins.add_rakefiles "attachmerb_fu/merbtasks"
+  
+  DataMapper::Resource.append_inclusions(AttachmerbFu::IncActMethods)
+  
 end
